@@ -1351,6 +1351,31 @@ function truncateCommandForEcho(command: string): string {
   return cleaned.slice(0, COMMAND_ECHO_MAX) + "…";
 }
 
+/**
+ * Per-call budget for the source-code echo prepended by `ctx_execute` and
+ * `ctx_execute_file` (Issues #717 + #736). The full code always reaches the
+ * sandbox — only the echo is clipped so massive payloads don't dominate
+ * the response. Multi-line preserved (unlike command echo) so the user
+ * sees the actual program shape.
+ */
+const CODE_ECHO_MAX = 2000;
+
+function truncateCodeForEcho(code: string): string {
+  if (code.length <= CODE_ECHO_MAX) return code;
+  return code.slice(0, CODE_ECHO_MAX) + "\n… (truncated)";
+}
+
+/**
+ * Build the source-code preamble surfaced before tool stdout. Provenance
+ * survives in indexed chunks (FTS5 sees the fenced block) so later
+ * ctx_search hits remember what ran.
+ */
+function buildExecuteEcho(language: string, code: string, path?: string): string {
+  const header = path ? `path=${path}\n` : "";
+  const fenced = `\`\`\`${language}\n${truncateCodeForEcho(code)}\n\`\`\``;
+  return `${header}${fenced}\n\n`;
+}
+
 function formatCommandOutput(label: string, command: string, raw: string, onFsBytes?: (bytes: number) => void): string {
   let output = raw || "(no output)";
   const fsMatches = output.matchAll(/__CM_FS__:(\d+)/g);
@@ -1630,6 +1655,11 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
       }
       const result = await executor.execute({ language, code: instrumentedCode, timeout, background });
 
+      // Echo the executed source code before stdout so users can audit
+      // and tooling can block command patterns (Issues #717 + #736).
+      // Built from the user-supplied `code`, NOT the instrumented variant.
+      const echo = buildExecuteEcho(language, code);
+
       // Parse sandbox network metrics from stderr
       const netMatch = result.stderr?.match(/__CM_NET__:(\d+)/);
       if (netMatch) {
@@ -1653,7 +1683,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
+                text: `${echo}${partialOutput}\n\n_(process backgrounded after ${timeout}ms — still running)_`,
               },
             ],
           });
@@ -1664,7 +1694,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
             content: [
               {
                 type: "text" as const,
-                text: `${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
+                text: `${echo}${partialOutput}\n\n_(timed out after ${timeout}ms — partial output shown above)_`,
               },
             ],
           });
@@ -1673,7 +1703,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           content: [
             {
               type: "text" as const,
-              text: `Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
+              text: `${echo}Execution timed out after ${timeout}ms\n\nstderr:\n${result.stderr}`,
             },
           ],
           isError: true,
@@ -1688,7 +1718,7 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`) },
+              { type: "text" as const, text: `${echo}${intentSearch(output, intent, isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
           });
@@ -1698,14 +1728,14 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
           trackIndexed(Buffer.byteLength(output));
           return trackResponse("ctx_execute", {
             content: [
-              { type: "text" as const, text: intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`) },
+              { type: "text" as const, text: `${echo}${intentSearch(output, "errors failures exceptions", isError ? `execute:${language}:error` : `execute:${language}`)}` },
             ],
             isError,
           });
         }
         return trackResponse("ctx_execute", {
           content: [
-            { type: "text" as const, text: output },
+            { type: "text" as const, text: `${echo}${output}` },
           ],
           isError,
         });
@@ -1718,19 +1748,29 @@ __cm_main().catch(e=>{console.error(e);process.exitCode=1});${background ? '\nse
         trackIndexed(Buffer.byteLength(stdout));
         return trackResponse("ctx_execute", {
           content: [
-            { type: "text" as const, text: intentSearch(stdout, intent, `execute:${language}`) },
+            { type: "text" as const, text: `${echo}${intentSearch(stdout, intent, `execute:${language}`)}` },
           ],
         });
       }
 
       // Auto-index large stdout into FTS5 — return pointer, not raw content
       if (Buffer.byteLength(stdout) > LARGE_OUTPUT_THRESHOLD) {
-        return trackResponse("ctx_execute", indexStdout(stdout, `execute:${language}`));
+        const indexed = indexStdout(stdout, `execute:${language}`);
+        // Prepend echo to the first text content so provenance still surfaces
+        const echoed = {
+          ...indexed,
+          content: indexed.content.map((c, i) =>
+            i === 0 && c.type === "text"
+              ? { ...c, text: `${echo}${(c as { text: string }).text}` }
+              : c,
+          ),
+        };
+        return trackResponse("ctx_execute", echoed);
       }
 
       return trackResponse("ctx_execute", {
         content: [
-          { type: "text" as const, text: stdout },
+          { type: "text" as const, text: `${echo}${stdout}` },
         ],
       });
     } catch (err: unknown) {
