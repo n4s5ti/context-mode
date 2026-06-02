@@ -606,6 +606,39 @@ function extractTask(input: HookInput): SessionEvent[] {
  * Note: Shift+Tab and /plan command do NOT fire PostToolUse hooks
  * (Claude Code bug #15660). Only programmatic EnterPlanMode is tracked.
  */
+/**
+ * FNV-1a 32-bit hash → 8-char lowercase hex. Stable across runs/platforms.
+ * Used for plan_hash so identical plans dedupe at the platform side.
+ */
+function fnv1a32Hex(s: string): string {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < s.length; i++) {
+    hash ^= s.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+/**
+ * Read the plan text from the ExitPlanMode envelope. SDK carries it on
+ * the OUTPUT (ExitPlanModeOutput @ :2222), but the PRD body cites input.
+ * Try both so we are spec-flexible.
+ */
+function extractExitPlanText(input: HookInput): string | null {
+  const inputPlan = input.tool_input["plan"];
+  if (typeof inputPlan === "string" && inputPlan.length > 0) return inputPlan;
+  const resp = input.tool_response;
+  if (typeof resp === "string" && resp.length > 0) {
+    try {
+      const parsed = JSON.parse(resp);
+      if (parsed && typeof parsed === "object" && typeof (parsed as Record<string, unknown>).plan === "string") {
+        return (parsed as Record<string, unknown>).plan as string;
+      }
+    } catch { /* fall through */ }
+  }
+  return null;
+}
+
 function extractPlan(input: HookInput): SessionEvent[] {
   if (input.tool_name === "EnterPlanMode") {
     return [{
@@ -621,12 +654,23 @@ function extractPlan(input: HookInput): SessionEvent[] {
 
     // Plan exit event with allowedPrompts detail
     const prompts = input.tool_input["allowedPrompts"];
-    const detail = Array.isArray(prompts) && prompts.length > 0
+    let detail = Array.isArray(prompts) && prompts.length > 0
       ? `exited plan mode (allowed: ${safeStringAny(prompts.map((p: unknown) => {
           if (typeof p === "object" && p !== null && "prompt" in p) return String((p as Record<string, unknown>).prompt);
           return String(p);
         }).join(", "))})`
       : "exited plan mode";
+
+    // §11 / PRD #6 — append plan_bytes + plan_hash so the platform can
+    // dedupe identical plans across sessions and JOIN plan_mode_authorized
+    // writes against a stable plan id. Plan source: tool_input.plan first
+    // (per PRD), fall back to tool_response.plan (SDK actually carries it
+    // there per ExitPlanModeOutput @ sdk-tools.d.ts:2222).
+    const plan = extractExitPlanText(input);
+    if (typeof plan === "string" && plan.length > 0) {
+      detail += ` plan_bytes:${plan.length} plan_hash:${fnv1a32Hex(plan)}`;
+    }
+
     events.push({
       type: "plan_exit",
       category: "plan",
@@ -1808,6 +1852,49 @@ export function extractUserEvents(message: string): SessionEvent[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * Issue #4 (new PRD) — SessionStart settings + MCP servers snapshot.
+ *
+ * Emits ONE session_settings_snapshot event when ≥1 setting is available
+ * on the SessionStart input. The data field carries key:value tokens
+ * (mcp_count, mcp_servers, model, permission_mode) so the platform can
+ * compute MCP integration counts and primary-model adoption per org.
+ * mcp_servers list is truncated to first 8 names.
+ */
+export function extractSessionSettings(input: unknown): SessionEvent[] {
+  if (!input || typeof input !== "object") return [];
+
+  const obj = input as Record<string, unknown>;
+  const parts: string[] = [];
+
+  const mcpServers = obj.mcp_servers;
+  let mcpKeys: string[] | null = null;
+  if (mcpServers && typeof mcpServers === "object" && !Array.isArray(mcpServers)) {
+    mcpKeys = Object.keys(mcpServers as Record<string, unknown>);
+    parts.push(`mcp_count:${mcpKeys.length}`);
+    if (mcpKeys.length > 0) {
+      parts.push(`mcp_servers:${mcpKeys.slice(0, 8).join(",")}`);
+    }
+  }
+
+  if (typeof obj.model === "string") {
+    parts.push(`model:${obj.model.slice(0, 64)}`);
+  }
+
+  if (typeof obj.permission_mode === "string") {
+    parts.push(`permission_mode:${obj.permission_mode.slice(0, 32)}`);
+  }
+
+  if (parts.length === 0) return [];
+
+  return [{
+    type: "session_settings_snapshot",
+    category: "env",
+    data: safeString(parts.join(" ")),
+    priority: 2,
+  }];
 }
 
 /**
