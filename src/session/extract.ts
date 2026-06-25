@@ -1542,14 +1542,21 @@ function extractAgentUsage(input: HookInput): SessionEvent[] {
  * the pricing catalog — omitted on a price miss. Returns null when every token
  * bucket is zero/absent (so an all-zero model emits no event).
  */
-function buildAgentUsageEvent(counts: {
+export function buildAgentUsageEvent(counts: {
   model_id: string;
   input_tokens: number;
   output_tokens: number;
   cache_creation_tokens: number;
   cache_read_tokens: number;
+  /**
+   * Provider-supplied USD cost for this turn. When a finite number, it is
+   * preferred over the catalog computation (openclaw / pi / omp / opencode
+   * ship a native cost — trust the source over our price table). Omit/null to
+   * derive cost_usd from the pricing catalog.
+   */
+  native_cost_usd?: number | null;
 }): SessionEvent | null {
-  const { model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens } = counts;
+  const { model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens, native_cost_usd } = counts;
   if (input_tokens <= 0 && output_tokens <= 0 && cache_creation_tokens <= 0 && cache_read_tokens <= 0) {
     return null;
   }
@@ -1558,7 +1565,9 @@ function buildAgentUsageEvent(counts: {
   if (cache_creation_tokens > 0) parts.push(`cache_create:${cache_creation_tokens}`);
   if (cache_read_tokens > 0) parts.push(`cache_read:${cache_read_tokens}`);
 
-  const cost = computeTurnCostUsd(model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens);
+  const cost = (typeof native_cost_usd === "number" && Number.isFinite(native_cost_usd))
+    ? native_cost_usd
+    : computeTurnCostUsd(model_id, input_tokens, output_tokens, cache_creation_tokens, cache_read_tokens);
   if (cost !== null) parts.push(`cost_usd:${formatCostUsd(cost)}`);
 
   const event: SessionEvent = {
