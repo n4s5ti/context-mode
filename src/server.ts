@@ -54,6 +54,7 @@ import {
   emitSandboxExecuteEvent,
 } from "./session/event-emit.js";
 import { persistToolCallCounter, restoreSessionStats } from "./session/persist-tool-calls.js";
+import { appendRetrievalBytes } from "./session/retrieval-marker.js";
 import { searchAllSources } from "./search/unified.js";
 import {
   buildCtxSearchInputSchema,
@@ -931,6 +932,17 @@ function trackResponse(toolName: string, response: ToolResult): ToolResult {
         bytesReturned: bytes,
       })
     );
+  }
+
+  // Retrieval ("With context-mode") bridge — ctx_search / ctx_fetch_and_index
+  // response bytes are the kept-out content the model paid to access. The
+  // PostToolUse hook never fires for the plugin's OWN MCP tools, so the
+  // hook-side extractMcpToolCall can never see these calls (bytes_retrieved
+  // was 0/124454 in prod). Drop the count into a marker keyed by the session
+  // DB; the next ordinary-tool PostToolUse consumes it and emits a forwardable
+  // bytes_retrieved event. Off the hot path; never throws.
+  if (toolName === "ctx_search" || toolName === "ctx_fetch_and_index") {
+    setImmediate(() => appendRetrievalBytes(getSessionDbPath(), bytes));
   }
 
   return response;
